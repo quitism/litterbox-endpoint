@@ -3,17 +3,12 @@ import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ROBLOSECURITY = process.env.ROBLOSECURITY || null; // <-- put your token in env var, never hardcode
+const ROBLOSECURITY = process.env.ROBLOSECURITY || null;
 
-// helper: sleep
-const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const jitter = (base) => base + Math.floor(Math.random() * 200);
 
-/**
- * helper that wraps fetch with timing, basic logging, and retry on 429/network errors.
- * - retries on 429 status or network errors (up to maxRetries)
- * - logs method/url, status, duration, response size, and attempt count
- */
-async function fetchWithRetries(url, opts = {}, { maxRetries = 2, name = 'fetch' } = {}) {
+async function fetchWithRetries(url, opts = {}, { maxRetries = 2, name = "fetch" } = {}) {
   let attempt = 0;
   while (true) {
     attempt++;
@@ -22,100 +17,119 @@ async function fetchWithRetries(url, opts = {}, { maxRetries = 2, name = 'fetch'
     try {
       res = await fetch(url, opts);
     } catch (err) {
-      const durErr = Date.now() - start;
-      console.error(`[${name}] attempt ${attempt} NETWORK ERROR for ${url} (${durErr}ms)`, err.message || err);
+      const dur = Date.now() - start;
+      console.error(`[${name}] attempt ${attempt} NETWORK ERROR ${url} (${dur}ms)`, err.message || err);
       if (attempt > maxRetries) throw err;
-      const backoff = 100 * Math.pow(2, attempt); // 200, 400ms...
-      await sleep(backoff);
+      await sleep(jitter(100 * Math.pow(2, attempt)));
       continue;
     }
 
     const duration = Date.now() - start;
-    const status = res.status;
-
-    // read body as text (safe to attempt; may be large for audio endpoints — but these endpoints here return JSON)
-    let text;
+    let text = null;
     try {
       text = await res.text();
     } catch (readErr) {
-      console.error(`[${name}] attempt ${attempt} failed to read body for ${url}`, readErr);
+      console.error(`[${name}] attempt ${attempt} failed to read body for ${url}`, readErr.message || readErr);
       if (attempt > maxRetries) throw readErr;
-      const backoff = 100 * Math.pow(2, attempt);
-      await sleep(backoff);
+      await sleep(jitter(100 * Math.pow(2, attempt)));
       continue;
     }
 
-    const size = text ? text.length : 0;
-    console.log(
-      `[${name}] attempt ${attempt} ${status} ${url} — ${duration}ms — ${size} bytes`
-    );
-
-    // try to parse JSON if content looks like JSON
     let json = null;
-    try {
-      json = text ? JSON.parse(text) : null;
-    } catch (parseErr) {
-      // not JSON — fine for some endpoints; log that it wasn't json
-      json = null;
-    }
+    try { json = text ? JSON.parse(text) : null; } catch {}
 
-    // if Roblox returns a 429 or JSON error indicating "Too many requests", retry
-    const hasTooManyRequests =
-      status === 429 ||
-      (json && (json.errors || []).some?.((e) => (e.message || '').toLowerCase().includes('too many')) ) ||
-      (json && json.code === 0 && (json.message || '').toLowerCase().includes('too many'));
+    console.log(`[${name}] attempt ${attempt} ${res.status} ${url} — ${duration}ms — ${text ? text.length : 0} bytes`);
 
-    if (hasTooManyRequests) {
-      console.warn(`[${name}] attempt ${attempt} rate-limited by Roblox for ${url}.`);
+    const tooManyRequests =
+      res.status === 429 ||
+      (json && ((Array.isArray(json.errors) && json.errors.some?.((e) => (e.message || "").toLowerCase().includes("too many"))) || (json.code === 0 && (json.message || "").toLowerCase().includes("too many"))));
+
+    if (tooManyRequests) {
+      console.warn(`[${name}] attempt ${attempt} rate-limited for ${url}`);
       if (attempt > maxRetries) {
-        // return parsed json or fallback to raw text and status
-        return { status, ok: res.ok, text, json };
+        return { status: res.status, ok: res.ok, text, json, headers: Object.fromEntries(res.headers.entries()) };
       }
-      const backoff = 200 * Math.pow(2, attempt); // 400ms, 800ms...
-      await sleep(backoff);
+      await sleep(jitter(200 * Math.pow(2, attempt)));
       continue;
     }
 
-    // everything looks good — return structured info
-    return { status, ok: res.ok, text, json, headers: res.headers.raw ? res.headers.raw() : {} };
-  } // end while
+    return { status: res.status, ok: res.ok, text, json, headers: Object.fromEntries(res.headers.entries()) };
+  }
 }
 
-// middleware: request logger
+// simple logger middleware
 app.use((req, res, next) => {
-  const id = req.query && req.query.id ? req.query.id : '-';
+  const id = req.query && req.query.id ? req.query.id : "-";
   const ts = new Date().toISOString();
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '-';
-  const ua = req.headers['user-agent'] || '-';
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "-";
+  const ua = req.headers["user-agent"] || "-";
   console.log(`[REQ] ${ts} ${req.method} ${req.path} id=${id} from=${ip} ua="${ua}"`);
   next();
 });
 
-// Thumbnail proxy (unchanged endpoint but with logging + retries)
+const thumbnailCache = new Map();
+const DEFAULT_TTL_MS = 30 * 60 * 1000;
+
 app.get("/thumbnail", async (req, res) => {
   try {
-    const id = req.query.id;
-    if (!id) return res.status(400).json({ error: "Missing id param" });
+    const raw = req.query.id;
+    if (!raw) return res.status(400).json({ error: "Missing id param" });
 
-    const url = `https://thumbnails.roblox.com/v1/assets?assetIds=${id}&size=420x420&format=Png`;
-    const result = await fetchWithRetries(url, {}, { maxRetries: 2, name: 'thumbnail' });
+    const reqIds = Array.from(new Set(raw.split(",").map(s => s.trim()).filter(Boolean)));
+    if (reqIds.length === 0) return res.status(400).json({ error: "No valid ids provided" });
 
-    if (!result.ok && result.status !== 200) {
-      console.warn(`[thumbnail] non-200 status for id=${id}:`, result.status);
+    const responseData = [];
+    const missingIds = [];
+
+    for (const id of reqIds) {
+      const cached = thumbnailCache.get(id);
+      if (cached && Date.now() < cached.expires) {
+        responseData.push(cached.entry);
+      } else {
+        missingIds.push(id);
+      }
     }
 
-    // prefer parsed json if available, else try to return parsed text
-    const payload = result.json ?? (result.text ? (() => { try { return JSON.parse(result.text); } catch { return { raw: result.text }; } })() : null);
+    if (missingIds.length > 0) {
+      const batchParam = missingIds.join(",");
+      const url = `https://thumbnails.roblox.com/v1/assets?assetIds=${encodeURIComponent(batchParam)}&size=420x420&format=Png`;
+
+      const result = await fetchWithRetries(url, {}, { maxRetries: 4, name: "thumbnail-batch" });
+
+      let payload = result.json ?? null;
+      if (!payload && result.text) {
+        try { payload = JSON.parse(result.text); } catch { payload = { data: [] }; }
+      }
+      payload = payload || { data: [] };
+
+      const items = Array.isArray(payload.data) ? payload.data : [];
+      const byId = new Map();
+      for (const item of items) {
+        const assetId = (item.assetId ?? item.targetId ?? item.id ?? item.targetId);
+        if (assetId !== undefined && assetId !== null) byId.set(String(assetId), item);
+      }
+
+      for (const id of missingIds) {
+        const item = byId.get(id);
+        let entry;
+        if (item) {
+          entry = item;
+        } else {
+          entry = { assetId: Number(id), state: "Error", errorMessage: "Not found or rate-limited" };
+        }
+        thumbnailCache.set(id, { expires: Date.now() + DEFAULT_TTL_MS, entry });
+        responseData.push(entry);
+      }
+    }
 
     res.set("Access-Control-Allow-Origin", "*");
-    res.json(payload);
+    res.json({ data: responseData });
   } catch (err) {
-    console.error(`[thumbnail] failed for id=${req.query.id}`, err);
-    res.status(500).json({ error: "Failed to fetch Roblox data" });
+    console.error(`[thumbnail] handler error`, err);
+    res.status(500).json({ error: "Internal error fetching thumbnails" });
   }
 });
 
-// AssetDelivery proxy for audio (returns JSON with "location")
 app.get("/asset", async (req, res) => {
   try {
     const id = req.query.id;
@@ -123,17 +137,13 @@ app.get("/asset", async (req, res) => {
 
     const url = `https://assetdelivery.roblox.com/v1/assetId/${id}`;
     const headers = {};
-    if (ROBLOSECURITY) {
-      headers.Cookie = `.ROBLOSECURITY=${ROBLOSECURITY}`;
-    }
+    if (ROBLOSECURITY) headers.Cookie = `.ROBLOSECURITY=${ROBLOSECURITY}`;
 
-    const result = await fetchWithRetries(url, { headers }, { maxRetries: 2, name: 'asset' });
+    const result = await fetchWithRetries(url, { headers }, { maxRetries: 3, name: "asset" });
 
-    // If we got some JSON parsed by helper, use it. Otherwise try to parse text.
     const data = result.json ?? (result.text ? (() => { try { return JSON.parse(result.text); } catch { return { raw: result.text }; } })() : null);
 
-    // Log important metadata about the response while avoiding secret exposure
-    console.log(`[asset] resolved id=${id} auth=${!!ROBLOSECURITY} status=${result.status} location=${data && data.location ? '[present]' : '[missing]'}`);
+    console.log(`[asset] resolved id=${id} auth=${!!ROBLOSECURITY} status=${result.status} location=${data && data.location ? "[present]" : "[missing]"}`);
 
     res.set("Access-Control-Allow-Origin", "*");
     res.json(data);
@@ -143,15 +153,13 @@ app.get("/asset", async (req, res) => {
   }
 });
 
-
-// optional: endpoint that redirects straight to audio file
 app.get("/audio", async (req, res) => {
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: "Missing id param" });
 
     const url = `https://assetdelivery.roblox.com/v1/assetId/${id}`;
-    const result = await fetchWithRetries(url, {}, { maxRetries: 2, name: 'audio-asset' });
+    const result = await fetchWithRetries(url, {}, { maxRetries: 3, name: "audio-asset" });
 
     const data = result.json ?? (result.text ? (() => { try { return JSON.parse(result.text); } catch { return { raw: result.text }; } })() : null);
 
@@ -160,10 +168,7 @@ app.get("/audio", async (req, res) => {
       return res.status(404).json({ error: "Audio location not found", raw: data ?? result.text });
     }
 
-    // Log the resolved CDN URL (but not headers/cookies)
-    console.log(`[audio] id=${id} -> resolved location (length=${data.location.length})`);
-
-    // Redirect to the real audio file
+    console.log(`[audio] id=${id} -> resolved location length=${data.location.length}`);
     res.redirect(data.location);
   } catch (err) {
     console.error(`[audio] failed for id=${req.query.id}`, err);
@@ -171,11 +176,13 @@ app.get("/audio", async (req, res) => {
   }
 });
 
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 app.listen(PORT, () => {
   console.log(`proxy listening on port ${PORT}`);
   if (!ROBLOSECURITY) {
-    console.warn('ROBLOSECURITY env var not set. Some asset endpoints may return different results or require authentication.');
+    console.warn("ROBLOSECURITY env var not set. Some asset endpoints may return different results or require authentication.");
   } else {
-    console.log('ROBLOSECURITY env var detected (value not logged for safety).');
+    console.log("ROBLOSECURITY env var detected (value not logged for safety).");
   }
 });
