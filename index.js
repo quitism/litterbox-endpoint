@@ -5,6 +5,22 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const ROBLOSECURITY = process.env.ROBLOSECURITY || null;
 
+// middleware near the top of index.js
+const ALLOWED_ORIGIN = "https://cw-litterbox.netlify.app";
+
+app.use((req, res, next) => {
+    const origin = req.get("origin");
+    const referer = req.get("referer");
+
+    // allow if exact match with your site
+    if (origin === ALLOWED_ORIGIN || (referer && referer.startsWith(ALLOWED_ORIGIN))) {
+        return next();
+    }
+
+    res.status(403).json({ error: "Forbidden" });
+});
+
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (base) => base + Math.floor(Math.random() * 200);
 
