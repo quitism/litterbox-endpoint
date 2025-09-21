@@ -12,7 +12,6 @@ app.use((req, res, next) => {
     const origin = req.get("origin");
     const referer = req.get("referer");
 
-    // allow if exact match with your site
     if (origin === ALLOWED_ORIGIN || (referer && referer.startsWith(ALLOWED_ORIGIN))) {
         return next();
     }
